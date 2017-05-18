@@ -6,6 +6,11 @@ import logging
 import os
 import signal
 import sys
+from contextlib import suppress
+from functools import partial
+
+from watchdog.observers import Observer
+from watchdog.events import LoggingEventHandler, FileSystemEventHandler
 
 # Status Constants
 FILE_KNOWN_UNTOUCHED = "FILE_KNOWN_UNTOUCHED"
@@ -13,13 +18,18 @@ FILE_KNOWN_TOUCHED = "FILE_KNOWN_TOUCHED"
 FILE_UNKNOWN = "FILE_UNKNOWN"
 
 # List of dangerous file extensions
-dangerous_extensions = set(["DMG","DLL", "ACTION","APK","APP","BAT","BIN","CMD","COM","COMMAND","CPL","CSH","EXE","GADGET","INF1","INS","INX","IPA","ISU","JOB","JSE","KSH","LNK","MSC","MSI","MSP","MST","OSX","OUT","PAF","PIF","PRG","PS1","REG","RGS","RUN","SCT","SH","SHB","SHS","U3P","VB","VBE","VBS","VBSCRIPT","WORKFLOW","WS","WSF"])
+dangerous_extensions = set(
+    ["DMG", "DLL", "ACTION", "APK", "APP", "BAT", "BIN", "CMD", "COM", "COMMAND", "CPL", "CSH", "EXE", "GADGET", "INF1",
+     "INS", "INX", "IPA", "ISU", "JOB", "JSE", "KSH", "LNK", "MSC", "MSI", "MSP", "MST", "OSX", "OUT", "PAF", "PIF",
+     "PRG", "PS1", "REG", "RGS", "RUN", "SCT", "SH", "SHB", "SHS", "U3P", "VB", "VBE", "VBS", "VBSCRIPT", "WORKFLOW",
+     "WS", "WSF"])
 
 # Global variables
 cached_db = None
 
+
 ###########
-#Utilities#
+# Utilities#
 ###########
 def shellquote(s):
     return "'" + s.replace("'", "'\\''") + "'"
@@ -104,12 +114,10 @@ def prepare_data_files(args):
     global cached_db
 
     # Wipe both alerts and db file in case the user wants to start fresh
-    try:
+    with suppress(IOError):
         if args.wipe:
             os.remove("binsnitch_data/db.json")
             os.remove("binsnitch_data/alerts.log")
-    except IOError:
-        pass # if the files are not there yet, then the wipe does not do anything anyway
 
     # Make sure the data folders exist
     if not os.path.exists("./binsnitch_data"):
@@ -127,87 +135,98 @@ def prepare_data_files(args):
 
     refresh_cache()
 
-############
-#Entrypoint#
-############
-parser = argparse.ArgumentParser()
-parser.add_argument("dir", type=str, help="the directory to monitor")
-parser.add_argument("-v", "--verbose", action="store_true", help="increase output verbosity")
-parser.add_argument("-s", "--singlepass", action="store_true", help="do a single pass over all files")
-parser.add_argument("-a", "--all", action="store_true", help="keep track of all files, not only executables")
-parser.add_argument("-n", "--new", action="store_true", help="alert on new files too, not only on modified files")
-parser.add_argument("-b", "--baseline", action="store_true", help="do not generate alerts (useful to create baseline)")
-parser.add_argument("-w", "--wipe", action="store_true", help="start with a clean db.json and alerts.log file")
 
-args = parser.parse_args()
-prepare_data_files(args)
+class ChangeHandler(FileSystemEventHandler):
+    def __init__(self, args):
+        self._args = args
 
-logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(message)s',
-                    datefmt = '%m/%d/%Y %I:%M:%S %p',
-                    filename = "binsnitch_data/alerts.log",
-                    level=logging.INFO)
-logging.getLogger().addHandler(logging.StreamHandler())
+    @staticmethod
+    def _dir(event):
+        return ' (DIR)' if event.is_directory else ''
 
-logging.info("binsnitch.py started")
+    def process(self, event):
+        """
+        event.event_type 
+            'modified' | 'created' | 'moved' | 'deleted'
+        event.is_directory
+            True | False
+        event.src_path
+            path/to/observed/file
+        """
+        # the file will be processed there
 
-if not os.path.isdir(args.dir):
-    print("Error: " + args.dir + " could not be read, exiting.")
-    exit()
+        # if self._args.verbose:
+        print(f'{event.src_path}{self._dir(event)}, {event.event_type}')
 
-print("Loaded " + str(len(cached_db)) + " items from db.json into cache")
+    def on_modified(self, event):
+        self.process(event)
 
-keepRunning = True
-while keepRunning:
+    def on_created(self, event):
+        self.process(event)
+
+    def on_deleted(self, event):
+        self.process(event)
+
+    def on_moved(self, event):
+        self.process(event)
+
+
+def args_parser():
+    ############
+    # Entrypoint#
+    ############
+    parser = argparse.ArgumentParser()
+    parser.add_argument("dir", type=str, help="the directory to monitor")
+    parser.add_argument("-v", "--verbose", action="store_true", help="increase output verbosity")
+    parser.add_argument("-s", "--singlepass", action="store_true", help="do a single pass over all files")
+    parser.add_argument("-a", "--all", action="store_true", help="keep track of all files, not only executables")
+    parser.add_argument("-n", "--new", action="store_true", help="alert on new files too, not only on modified files")
+    parser.add_argument("-b", "--baseline", action="store_true",
+                        help="do not generate alerts (useful to create baseline)")
+    parser.add_argument("-w", "--wipe", action="store_true", help="start with a clean db.json and alerts.log file")
+
+    return parser.parse_args()
+
+
+def signal_handler(observer, signal, frame):
+    observer.stop()
+    sys.exit(0)
+
+
+def scan(args):
+    # global cached_db
+
     logging.info("Scanning " + str(args.dir) + " for new and modified files, this can take a long time")
 
-    for dirName, subdirList, fileList in os.walk(args.dir, topdown=False):
-        try:
-            if args.verbose:
-                print('Scanning %s' % dirName)
-        except UnicodeEncodeError as e:
-            continue
+    if not os.path.isdir(args.dir):
+        print("Error: " + args.dir + " could not be read, exiting.")
+        exit()
 
-        for filename in fileList:
-            full_path = os.path.join(dirName, filename)
-            file_extension = str.upper(os.path.splitext(full_path)[1][1:])
+    # print("Loaded " + str(len(cached_db)) + " items from db.json into cache")
+    event_handler = LoggingEventHandler()
 
-            try:
-                process_file = False
+    # start observer for files
+    observer = Observer()
+    observer.schedule(ChangeHandler(args), args.dir, recursive=True)
+    observer.start()
+    signal.signal(signal.SIGINT, partial(signal_handler, observer))
+    observer.join()  # wait for observer thread
 
-                if args.all:
-                    process_file = True
-                else:
-                    if file_extension in dangerous_extensions:
-                        process_file = True
 
-                if process_file:
-                    file_hash = sha256_checksum(full_path)
+def main():
 
-                    file_info = dict()
-                    file_info["path"] = full_path
-                    file_info["sha256"] = file_hash
+    # logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
+    #                     datefmt='%m/%d/%Y %I:%M:%S %p',
+    #                     filename="binsnitch_data/alerts.log",
+    #                     level=logging.INFO)
+    # logging.getLogger().addHandler(logging.StreamHandler())
+    #
+    # logging.info("binsnitch.py started")
 
-                    status = check_file_status(file_info)
+    args = args_parser()
+    # prepare_data_files(args)
 
-                    if status == FILE_UNKNOWN:
-                        add_file_to_db(file_info)
+    scan(args)
 
-                        if args.new and not args.baseline:
-                            add_alert_do_db(file_info, FILE_UNKNOWN)
-
-                    elif status == FILE_KNOWN_TOUCHED:
-                        if not args.baseline:
-                            add_alert_do_db(file_info, FILE_KNOWN_TOUCHED)
-
-                    elif status == FILE_KNOWN_UNTOUCHED:
-                        pass
-
-            except Exception as exc:
-                print(str(sys.exc_info()))
-
-    if not args.singlepass:
-        logging.info("Finished! Sleeping for a minute before scanning " + args.dir + " for changes again")
-        time.sleep(60)
-    else:
-        logging.info("Finished!")
-        keepRunning = False
+if __name__ == '__main__':
+    main()
